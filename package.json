@@ -1,0 +1,19 @@
+{
+  "name": "a-share-ledger",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.server.json && tsc -p tsconfig.client.json",
+    "start": "npm run build && node dist/server/server.js",
+    "dev": "npm run build && node --watch dist/server/server.js",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.client.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
