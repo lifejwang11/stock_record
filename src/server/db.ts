@@ -60,6 +60,7 @@ function migrateSchema(): void {
 
   createSnapshotTable();
   recreateQuoteCacheIfNeeded();
+  migrateAssetTypes();
 }
 
 function createCurrentSchema(): void {
@@ -72,7 +73,7 @@ function createPositionAndTradeTables(): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS positions (
       instrument_id TEXT PRIMARY KEY,
-      asset_type TEXT NOT NULL CHECK (asset_type IN ('cn', 'us', 'crypto')),
+      asset_type TEXT NOT NULL CHECK (asset_type IN ('cn', 'fund', 'us', 'crypto', 'gold')),
       symbol TEXT NOT NULL,
       secid TEXT NOT NULL,
       name TEXT NOT NULL,
@@ -86,7 +87,7 @@ function createPositionAndTradeTables(): void {
     CREATE TABLE IF NOT EXISTS trades (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       instrument_id TEXT NOT NULL,
-      asset_type TEXT NOT NULL CHECK (asset_type IN ('cn', 'us', 'crypto')),
+      asset_type TEXT NOT NULL CHECK (asset_type IN ('cn', 'fund', 'us', 'crypto', 'gold')),
       symbol TEXT NOT NULL,
       name TEXT NOT NULL,
       currency TEXT NOT NULL CHECK (currency IN ('CNY', 'USD')),
@@ -106,12 +107,30 @@ function createSnapshotTable(): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS daily_snapshots (
       day TEXT PRIMARY KEY,
+      daily_pnl REAL,
       total_pnl REAL NOT NULL,
       realized_pnl REAL NOT NULL,
       holding_pnl REAL NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS daily_snapshot_breakdowns (
+      day TEXT NOT NULL,
+      category TEXT NOT NULL,
+      instrument_id TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      name TEXT NOT NULL,
+      currency TEXT NOT NULL CHECK (currency IN ('CNY', 'USD')),
+      daily_pnl REAL NOT NULL,
+      daily_pnl_cny REAL NOT NULL,
+      PRIMARY KEY (day, instrument_id),
+      FOREIGN KEY (day) REFERENCES daily_snapshots(day) ON DELETE CASCADE
+    );
   `);
+
+  if (!tableColumns("daily_snapshots").includes("daily_pnl")) {
+    db.exec("ALTER TABLE daily_snapshots ADD COLUMN daily_pnl REAL;");
+  }
 }
 
 function createQuoteCacheTable(): void {
@@ -142,6 +161,35 @@ function recreateQuoteCacheIfNeeded(): void {
   if (columns.length === 0 || !columns.includes("instrument_id")) {
     db.exec("DROP TABLE IF EXISTS quote_cache;");
     createQuoteCacheTable();
+  }
+}
+
+function tableCreateSql(table: string): string {
+  const row = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(table) as { sql?: string } | undefined;
+  return row?.sql ?? "";
+}
+
+function migrateAssetTypes(): void {
+  const sql = tableCreateSql("positions");
+  if (!sql || (sql.includes("'gold'") && sql.includes("'fund'"))) return;
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec("ALTER TABLE positions RENAME TO positions_pre_asset_types;");
+    db.exec("ALTER TABLE trades RENAME TO trades_pre_asset_types;");
+    createPositionAndTradeTables();
+    db.exec(`
+      INSERT INTO positions SELECT * FROM positions_pre_asset_types;
+      INSERT INTO trades SELECT * FROM trades_pre_asset_types;
+      DROP TABLE positions_pre_asset_types;
+      DROP TABLE trades_pre_asset_types;
+    `);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
   }
 }
 
@@ -367,30 +415,72 @@ export function addSell(input: {
 
 export function saveDailySnapshot(input: {
   day: string;
+  dailyPnl: number;
   totalPnl: number;
   realizedPnl: number;
   holdingPnl: number;
+  breakdowns: Array<{
+    category: string;
+    instrumentId: string;
+    symbol: string;
+    name: string;
+    currency: Currency;
+    dailyPnl: number;
+    dailyPnlCny: number;
+  }>;
 }): void {
-  db.prepare(`
-    INSERT INTO daily_snapshots(
-      day, total_pnl, realized_pnl, holding_pnl, updated_at
-    ) VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(day) DO UPDATE SET
-      total_pnl = excluded.total_pnl,
-      realized_pnl = excluded.realized_pnl,
-      holding_pnl = excluded.holding_pnl,
-      updated_at = excluded.updated_at
-  `).run(
-    input.day,
-    input.totalPnl,
-    input.realizedPnl,
-    input.holdingPnl,
-    new Date().toISOString()
-  );
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(`
+      INSERT INTO daily_snapshots(
+        day, daily_pnl, total_pnl, realized_pnl, holding_pnl, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(day) DO UPDATE SET
+        daily_pnl = excluded.daily_pnl,
+        total_pnl = excluded.total_pnl,
+        realized_pnl = excluded.realized_pnl,
+        holding_pnl = excluded.holding_pnl,
+        updated_at = excluded.updated_at
+    `).run(
+      input.day,
+      input.dailyPnl,
+      input.totalPnl,
+      input.realizedPnl,
+      input.holdingPnl,
+      new Date().toISOString()
+    );
+
+    db.prepare("DELETE FROM daily_snapshot_breakdowns WHERE day = ?").run(
+      input.day
+    );
+    const insertBreakdown = db.prepare(`
+      INSERT INTO daily_snapshot_breakdowns(
+        day, category, instrument_id, symbol, name, currency,
+        daily_pnl, daily_pnl_cny
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const item of input.breakdowns) {
+      insertBreakdown.run(
+        input.day,
+        item.category,
+        item.instrumentId,
+        item.symbol,
+        item.name,
+        item.currency,
+        item.dailyPnl,
+        item.dailyPnlCny
+      );
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
 export function listDailySnapshots(): Array<{
   day: string;
+  daily_pnl: number | null;
   total_pnl: number;
   realized_pnl: number;
   holding_pnl: number;
@@ -399,6 +489,24 @@ export function listDailySnapshots(): Array<{
   return db
     .prepare("SELECT * FROM daily_snapshots ORDER BY day")
     .all() as unknown as ReturnType<typeof listDailySnapshots>;
+}
+
+export function listDailySnapshotBreakdowns(): Array<{
+  day: string;
+  category: string;
+  instrument_id: string;
+  symbol: string;
+  name: string;
+  currency: Currency;
+  daily_pnl: number;
+  daily_pnl_cny: number;
+}> {
+  return db
+    .prepare(`
+      SELECT * FROM daily_snapshot_breakdowns
+      ORDER BY day, daily_pnl_cny DESC, name, symbol
+    `)
+    .all() as unknown as ReturnType<typeof listDailySnapshotBreakdowns>;
 }
 
 function formatQty(value: number): string {

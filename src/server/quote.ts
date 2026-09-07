@@ -8,13 +8,79 @@ import type {
 
 const EAST_MONEY_ENDPOINT = "https://push2.eastmoney.com/api/qt/stock/get";
 const EAST_MONEY_SEARCH = "https://searchapi.eastmoney.com/api/suggest/get";
+const EAST_MONEY_FUND_NAV = "https://api.fund.eastmoney.com/f10/lsjz";
 const EAST_MONEY_SEARCH_TOKEN = "D43BF722C8E33BDC906FB84D85E326E8";
 const TENCENT_ENDPOINT = "https://qt.gtimg.cn/q=";
-const COINGECKO_SEARCH = "https://api.coingecko.com/api/v3/search";
-const COINGECKO_PRICE = "https://api.coingecko.com/api/v3/simple/price";
+const BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/24hr";
+const BINANCE_EXCHANGE_INFO = "https://api.binance.com/api/v3/exchangeInfo";
 const OKX_TICKER = "https://www.okx.com/api/v5/market/ticker";
 const OKX_INSTRUMENTS = "https://www.okx.com/api/v5/public/instruments";
+const JD_GOLD_PRICE = "https://api.jdjygold.com/gw2/generic/produTools/h5/m/getGoldPrice";
+const JD_GOLD_SKU_PRICE = "https://api.jdjygold.com/gw2/generic/jrm/h5/m/stdLatestPrice";
+const JD_MINSHENG_PRICE = "https://api.jdjygold.com/gw/generic/hj/h5/m/latestPrice";
 const USD_CNH_SECID = "133.USDCNH";
+
+interface GoldProduct {
+  symbol: string;
+  sku: string;
+  uniqueCode: string;
+  name: string;
+  bank: string;
+  aliases: string[];
+}
+
+const GOLD_PRODUCTS: GoldProduct[] = [
+  {
+    symbol: "CZB",
+    sku: "1961543816",
+    uniqueCode: "CZB-JCJ",
+    name: "浙商积存金",
+    bank: "浙商银行",
+    aliases: ["浙商", "czb", "zs"]
+  },
+  {
+    symbol: "CMBC",
+    sku: "21001001000001",
+    uniqueCode: "CMBC-JCJ",
+    name: "民生积存金",
+    bank: "民生银行",
+    aliases: ["民生", "cmbc", "ms"]
+  },
+  {
+    symbol: "ICBC",
+    sku: "2005453243",
+    uniqueCode: "ICBC-JCJ",
+    name: "工商积存金",
+    bank: "工商银行",
+    aliases: ["工商", "工行", "icbc"]
+  },
+  {
+    symbol: "CGB",
+    sku: "2024345112",
+    uniqueCode: "CGB-JCJ0",
+    name: "广发积存金",
+    bank: "广发银行",
+    aliases: ["广发", "cgb", "gf"]
+  },
+  {
+    symbol: "CIB",
+    sku: "2039007297",
+    uniqueCode: "CIB-JCJ0",
+    name: "兴业积存金",
+    bank: "兴业银行",
+    aliases: ["兴业", "cib"]
+  },
+  {
+    symbol: "CNCB",
+    sku: "2045976593",
+    uniqueCode: "CNCB-JCJ",
+    name: "中信积存金",
+    bank: "中信银行",
+    aliases: ["中信", "cncb", "citic"]
+  }
+];
+
+const GOLD_CATALOG_KEYWORDS = new Set(["积存金", "黄金", "金", "gold", "jcj"]);
 
 const PROVIDER_TIMEOUT_MS = 2200;
 const SEARCH_TIMEOUT_MS = 2800;
@@ -57,6 +123,12 @@ const headers = {
   tencent: {
     Referer: "https://gu.qq.com/",
     "User-Agent": "Mozilla/5.0 InvestmentLedger/1.0"
+  },
+  jdgold: {
+    Referer: "https://m.jdjygold.com/",
+    Origin: "https://m.jdjygold.com",
+    Accept: "application/json",
+    "User-Agent": "Mozilla/5.0 InvestmentLedger/1.0"
   }
 };
 
@@ -68,19 +140,27 @@ export function instrumentIdOf(ref: InstrumentRef): string {
     const key = (ref.secid || ref.symbol).trim().toLowerCase();
     return `crypto:${key}`;
   }
+  if (ref.assetType === "fund" || (ref.assetType === "cn" && ref.secid.startsWith("150."))) {
+    return `fund:${ref.symbol.trim()}`;
+  }
   return `${ref.assetType}:${ref.symbol.trim().toUpperCase()}`;
 }
 
 export function assetLabel(assetType: AssetType, name = ""): string {
+  if (assetType === "fund") return "场外基金";
   if (assetType === "us") return "美股";
   if (assetType === "crypto") return "加密货币";
+  if (assetType === "gold") return "积存金";
   if (/ETF/i.test(name)) return "ETF";
   if (/LOF/i.test(name)) return "LOF";
   return "A股";
 }
 
 export function quantityUnit(assetType: AssetType): string {
-  return assetType === "crypto" ? "枚" : "股";
+  if (assetType === "fund") return "份";
+  if (assetType === "crypto") return "枚";
+  if (assetType === "gold") return "克";
+  return "股";
 }
 
 export function normalizeCnSymbol(input: string): {
@@ -114,13 +194,23 @@ export async function searchInstruments(
   assetType: AssetType
 ): Promise<SearchHit[]> {
   const keyword = query.trim();
+  if (assetType === "gold") return searchGold(keyword);
   if (!keyword) throw new Error("请输入要搜索的名称或代码");
   if (assetType === "crypto") return searchCrypto(keyword);
+  if (assetType === "fund") {
+    return (await searchEastMoney(keyword, "cn")).filter(
+      (hit) => hit.assetType === "fund"
+    );
+  }
   return searchEastMoney(keyword, assetType);
 }
 
 export async function fetchQuote(ref: InstrumentRef): Promise<Quote> {
+  if (ref.assetType === "fund" || (ref.assetType === "cn" && ref.secid.startsWith("150."))) {
+    return fetchFundQuote({ ...ref, assetType: "fund" });
+  }
   if (ref.assetType === "crypto") return fetchCryptoQuote(ref);
+  if (ref.assetType === "gold") return fetchGoldQuote(ref);
   if (ref.assetType === "us") return fetchUsQuote(ref);
   return fetchCnQuote(ref);
 }
@@ -141,8 +231,32 @@ export async function fetchUsdCnyRate(): Promise<number> {
     errors.push(errorMessage(error));
   }
 
+  try {
+    const rate = await fetchUsdCnyFallback();
+    fxCache = { rate, at: Date.now() };
+    return rate;
+  } catch (error) {
+    errors.push(errorMessage(error));
+  }
+
   if (fxCache) return fxCache.rate;
   throw new Error(`美元汇率不可用：${errors.join("；")}`);
+}
+
+async function fetchUsdCnyFallback(): Promise<number> {
+  const response = await fetch("https://open.er-api.com/v6/latest/USD", {
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS)
+  });
+  if (!response.ok) throw new Error(`备用汇率返回 ${response.status}`);
+  const payload = (await response.json()) as {
+    result?: string;
+    rates?: { CNY?: number };
+  };
+  const rate = finiteNumber(payload.rates?.CNY);
+  if (payload.result !== "success" || rate <= 0) {
+    throw new Error("备用汇率无效");
+  }
+  return rate;
 }
 
 async function searchEastMoney(
@@ -177,15 +291,20 @@ async function searchEastMoney(
     const mktNum = String(row.MktNum || "");
     if (!symbol || !name || !secid) continue;
 
+    let hitAssetType: AssetType = assetType;
     if (assetType === "cn") {
-      if (!isCnListedHit(symbol, secid, mktNum, marketName)) continue;
+      if (isCnOtcFundHit(symbol, secid, mktNum, marketName)) {
+        hitAssetType = "fund";
+      } else if (!isCnListedHit(symbol, secid, mktNum, marketName)) {
+        continue;
+      }
     } else {
       if (marketName !== "美股" || !US_MARKET_IDS.has(mktNum)) continue;
       if (/notes|债券|债/i.test(name)) continue;
     }
 
     const ref: InstrumentRef = {
-      assetType,
+      assetType: hitAssetType,
       symbol: assetType === "us" ? symbol.toUpperCase() : symbol,
       secid
     };
@@ -199,7 +318,9 @@ async function searchEastMoney(
       market:
         assetType === "us"
           ? US_MARKET_LABEL[mktNum] || "美股"
-          : cnMarketLabel(name, marketName),
+          : hitAssetType === "fund"
+            ? "场外基金"
+            : cnMarketLabel(name, marketName),
       currency: assetType === "us" ? "USD" : "CNY"
     });
   }
@@ -207,54 +328,218 @@ async function searchEastMoney(
   return hits;
 }
 
-async function searchCrypto(keyword: string): Promise<SearchHit[]> {
-  try {
-    return await searchCoinGecko(keyword);
-  } catch (error) {
-    try {
-      return await searchOkx(keyword);
-    } catch {
-      throw new Error(`加密货币搜索失败：${errorMessage(error)}`);
-    }
+async function fetchFundQuote(ref: InstrumentRef): Promise<Quote> {
+  const symbol = ref.symbol.trim();
+  if (!/^\d{6}$/.test(symbol)) {
+    throw new Error("场外基金代码应为 6 位数字，例如 016665");
   }
+
+  const url = new URL(EAST_MONEY_FUND_NAV);
+  url.searchParams.set("fundCode", symbol);
+  url.searchParams.set("pageIndex", "1");
+  url.searchParams.set("pageSize", "2");
+  const response = await fetch(url, {
+    headers: {
+      ...headers.eastmoney,
+      Referer: `https://fund.eastmoney.com/${symbol}.html`
+    },
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS)
+  });
+  if (!response.ok) throw new Error(`基金净值服务返回 ${response.status}`);
+  const payload = (await response.json()) as {
+    ErrCode?: number;
+    Data?: {
+      LSJZList?: Array<{
+        FSRQ?: string;
+        DWJZ?: string;
+        JZZZL?: string;
+      }>;
+    };
+  };
+  const rows = payload.Data?.LSJZList ?? [];
+  const latest = rows[0];
+  const price = finiteNumber(latest?.DWJZ);
+  if (payload.ErrCode !== 0 || !latest?.FSRQ || price <= 0) {
+    throw new Error("东方财富未找到该场外基金净值");
+  }
+  const previousClose = finiteNumber(rows[1]?.DWJZ) || price;
+  const change = price - previousClose;
+  const changePercent =
+    finiteNumber(latest.JZZZL) ||
+    (previousClose ? (change / previousClose) * 100 : 0);
+  const normalizedRef: InstrumentRef = {
+    assetType: "fund",
+    symbol,
+    secid: ref.secid || `150.${symbol}`
+  };
+  return {
+    ...normalizedRef,
+    instrumentId: instrumentIdOf(normalizedRef),
+    name: `基金 ${symbol}`,
+    market: "场外基金",
+    currency: "CNY",
+    price,
+    previousClose,
+    open: price,
+    high: price,
+    low: price,
+    change,
+    changePercent,
+    quoteTime: `${latest.FSRQ}T15:00:00+08:00`
+  };
 }
 
-async function searchCoinGecko(keyword: string): Promise<SearchHit[]> {
-  const url = new URL(COINGECKO_SEARCH);
-  url.searchParams.set("query", keyword);
-  const response = await fetch(url, {
+async function searchCrypto(keyword: string): Promise<SearchHit[]> {
+  const errors: string[] = [];
+  try {
+    const hits = await searchBinance(keyword);
+    if (hits.length) return hits;
+    errors.push("Binance 未找到匹配代币");
+  } catch (error) {
+    errors.push(errorMessage(error));
+  }
+  try {
+    const hits = await searchOkx(keyword);
+    if (hits.length) return hits;
+    errors.push("OKX 未找到匹配代币");
+  } catch (error) {
+    errors.push(errorMessage(error));
+  }
+  throw new Error(`加密货币搜索失败：${errors.join("；")}`);
+}
+
+function searchGold(keyword: string): SearchHit[] {
+  const needle = keyword.trim().toLowerCase();
+  const products =
+    !needle || GOLD_CATALOG_KEYWORDS.has(needle)
+      ? GOLD_PRODUCTS
+      : GOLD_PRODUCTS.filter((item) =>
+          [item.symbol, item.name, item.bank, item.sku, ...item.aliases]
+            .join(" ")
+            .toLowerCase()
+            .includes(needle)
+        );
+  return products.map(goldHit);
+}
+
+function goldHit(product: GoldProduct): SearchHit {
+  const ref: InstrumentRef = {
+    assetType: "gold",
+    symbol: product.symbol,
+    secid: product.sku
+  };
+  return {
+    ...ref,
+    instrumentId: instrumentIdOf(ref),
+    name: product.name,
+    market: product.bank,
+    currency: "CNY"
+  };
+}
+
+function resolveGoldProduct(ref: InstrumentRef): GoldProduct {
+  const symbol = ref.symbol.trim().toUpperCase();
+  const sku = ref.secid.trim();
+  const found = GOLD_PRODUCTS.find(
+    (item) => item.symbol === symbol || item.sku === sku
+  );
+  if (!found) throw new Error("未找到该积存金产品，请重新搜索");
+  return found;
+}
+
+function goldQuote(
+  product: GoldProduct,
+  input: {
+    price: number;
+    previousClose: number;
+    open?: number;
+    high?: number;
+    low?: number;
+    change?: number;
+    changePercent?: number;
+    quoteTime?: string;
+  }
+): Quote {
+  const hit = goldHit(product);
+  const previousClose = input.previousClose || input.price;
+  const price = input.price;
+  return {
+    ...hit,
+    price,
+    previousClose,
+    open: input.open || previousClose,
+    high: input.high || Math.max(price, previousClose),
+    low: input.low || Math.min(price, previousClose),
+    change: input.change || price - previousClose,
+    changePercent:
+      input.changePercent ||
+      (previousClose ? ((price - previousClose) / previousClose) * 100 : 0),
+    quoteTime: input.quoteTime || new Date().toISOString()
+  };
+}
+
+async function searchBinance(keyword: string): Promise<SearchHit[]> {
+  const needle = keyword.trim().toUpperCase();
+  const exactSymbol = needle.endsWith("USDT") ? needle : `${needle}USDT`;
+  try {
+    const hit = await fetchBinanceTickerHit(exactSymbol);
+    if (hit) return [hit];
+  } catch (error) {
+    if (!isBinanceUnknownSymbol(error)) throw error;
+  }
+
+  const response = await fetch(BINANCE_EXCHANGE_INFO, {
     headers: { "User-Agent": "InvestmentLedger/1.0" },
     signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS)
   });
-  if (!response.ok) throw new Error(`CoinGecko 搜索返回 ${response.status}`);
+  if (!response.ok) throw new Error(`Binance 搜索返回 ${response.status}`);
   const payload = (await response.json()) as {
-    coins?: Array<{
-      id?: string;
-      name?: string;
+    symbols?: Array<{
       symbol?: string;
-      market_cap_rank?: number | null;
+      status?: string;
+      baseAsset?: string;
+      quoteAsset?: string;
     }>;
   };
-  const coins = [...(payload.coins ?? [])]
-    .sort((a, b) => (a.market_cap_rank || 99999) - (b.market_cap_rank || 99999))
-    .slice(0, 10);
+  return (payload.symbols ?? [])
+    .filter(
+      (row) =>
+        row.status === "TRADING" &&
+        row.quoteAsset === "USDT" &&
+        row.baseAsset &&
+        row.symbol &&
+        (row.baseAsset === needle ||
+          row.symbol === needle ||
+          row.symbol === exactSymbol ||
+          row.baseAsset.includes(needle) ||
+          row.symbol.includes(needle))
+    )
+    .slice(0, 10)
+    .map((row) => binanceHit(String(row.baseAsset)));
+}
 
-  return coins
-    .filter((coin) => coin.id && coin.symbol && coin.name)
-    .map((coin) => {
-      const ref: InstrumentRef = {
-        assetType: "crypto",
-        symbol: String(coin.symbol).toUpperCase(),
-        secid: String(coin.id)
-      };
-      return {
-        ...ref,
-        instrumentId: instrumentIdOf(ref),
-        name: String(coin.name),
-        market: "Crypto",
-        currency: "USD" as const
-      };
-    });
+function binanceHit(baseAsset: string): SearchHit {
+  const symbol = baseAsset.toUpperCase();
+  const ref: InstrumentRef = {
+    assetType: "crypto",
+    symbol,
+    secid: symbol.toLowerCase()
+  };
+  return {
+    ...ref,
+    instrumentId: instrumentIdOf(ref),
+    name: symbol,
+    market: "Binance",
+    currency: "USD"
+  };
+}
+
+async function fetchBinanceTickerHit(pairSymbol: string): Promise<SearchHit | null> {
+  const row = await requestBinanceTicker(pairSymbol);
+  const price = finiteNumber(row.lastPrice);
+  if (price <= 0) return null;
+  const baseAsset = pairSymbol.toUpperCase().replace(/USDT$/, "");
+  return binanceHit(baseAsset);
 }
 
 async function searchOkx(keyword: string): Promise<SearchHit[]> {
@@ -381,7 +666,7 @@ async function fetchUsQuote(ref: InstrumentRef): Promise<Quote> {
 async function fetchCryptoQuote(ref: InstrumentRef): Promise<Quote> {
   const errors: string[] = [];
   try {
-    return await fetchCoinGeckoQuote(ref);
+    return await fetchBinanceQuote(ref);
   } catch (error) {
     errors.push(errorMessage(error));
   }
@@ -391,6 +676,125 @@ async function fetchCryptoQuote(ref: InstrumentRef): Promise<Quote> {
     errors.push(errorMessage(error));
   }
   throw new Error(`所有行情服务均不可用：${errors.join("；")}`);
+}
+
+async function fetchGoldQuote(ref: InstrumentRef): Promise<Quote> {
+  const product = resolveGoldProduct(ref);
+  const errors: string[] = [];
+  try {
+    return await fetchJdUniqueCodeQuote(product);
+  } catch (error) {
+    errors.push(errorMessage(error));
+  }
+  try {
+    return await fetchJdSkuQuote(product);
+  } catch (error) {
+    errors.push(errorMessage(error));
+  }
+  if (product.symbol === "CMBC") {
+    try {
+      return await fetchMinShengQuote(product);
+    } catch (error) {
+      errors.push(errorMessage(error));
+    }
+  }
+  throw new Error(`所有行情服务均不可用：${errors.join("；")}`);
+}
+
+async function fetchJdUniqueCodeQuote(product: GoldProduct): Promise<Quote> {
+  const url = new URL(JD_GOLD_PRICE);
+  url.searchParams.set("goldCode", product.uniqueCode);
+  const response = await fetch(url, {
+    headers: headers.jdgold,
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS)
+  });
+  if (!response.ok) throw new Error(`京东金价服务返回 ${response.status}`);
+  const payload = (await response.json()) as {
+    resultData?: {
+      data?: {
+        lastPrice?: number | string;
+        preClose?: number | string;
+        openPrice?: number | string;
+        highPrice?: number | string;
+        lowPrice?: number | string;
+        raise?: number | string;
+        raisePercent?: number | string;
+        tradeDateTime?: JdTradeDateTime;
+      };
+    };
+  };
+  const data = payload.resultData?.data;
+  const price = finiteNumber(data?.lastPrice);
+  if (!data || price <= 0) throw new Error("京东金价未找到该积存金行情");
+  return goldQuote(product, {
+    price,
+    previousClose: finiteNumber(data.preClose) || price,
+    open: finiteNumber(data.openPrice),
+    high: finiteNumber(data.highPrice),
+    low: finiteNumber(data.lowPrice),
+    change: finiteNumber(data.raise),
+    changePercent: finiteNumber(data.raisePercent) * 100,
+    quoteTime: jdTradeDateTime(data.tradeDateTime)
+  });
+}
+
+async function fetchJdSkuQuote(product: GoldProduct): Promise<Quote> {
+  const url = new URL(JD_GOLD_SKU_PRICE);
+  url.searchParams.set("productSku", product.sku);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      ...headers.jdgold,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ reqData: { productSku: product.sku } }),
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS)
+  });
+  if (!response.ok) throw new Error(`京东积存金行情返回 ${response.status}`);
+  return parseJdSkuPayload(product, await response.json());
+}
+
+async function fetchMinShengQuote(product: GoldProduct): Promise<Quote> {
+  const response = await fetch(JD_MINSHENG_PRICE, {
+    method: "POST",
+    headers: {
+      ...headers.jdgold,
+      "Content-Type": "application/json"
+    },
+    body: "{}",
+    signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS)
+  });
+  if (!response.ok) throw new Error(`民生积存金行情返回 ${response.status}`);
+  return parseJdSkuPayload(product, await response.json());
+}
+
+function parseJdSkuPayload(product: GoldProduct, payload: unknown): Quote {
+  const body = payload as {
+    success?: boolean;
+    resultData?: {
+      status?: string;
+      datas?: {
+        price?: string | number;
+        yesterdayPrice?: string | number;
+        upAndDownAmt?: string | number;
+        upAndDownRate?: string;
+        time?: string | number;
+      };
+    };
+  };
+  const data = body.resultData?.datas;
+  const price = finiteNumber(data?.price);
+  if (!data || body.resultData?.status === "FAIL" || price <= 0) {
+    throw new Error("京东积存金未找到该产品行情");
+  }
+  const previousClose = finiteNumber(data.yesterdayPrice) || price;
+  return goldQuote(product, {
+    price,
+    previousClose,
+    change: finiteNumber(data.upAndDownAmt),
+    changePercent: percentNumber(data.upAndDownRate),
+    quoteTime: jdMillisTime(data.time)
+  });
 }
 
 async function fetchEastMoneyQuote(input: {
@@ -481,46 +885,80 @@ async function fetchTencentQuote(input: {
   };
 }
 
-async function fetchCoinGeckoQuote(ref: InstrumentRef): Promise<Quote> {
-  const id = (ref.secid || ref.symbol).trim().toLowerCase();
-  const url = new URL(COINGECKO_PRICE);
-  url.searchParams.set("ids", id);
-  url.searchParams.set("vs_currencies", "usd");
-  url.searchParams.set("include_24hr_change", "true");
+interface BinanceTicker {
+  symbol?: string;
+  lastPrice?: string;
+  prevClosePrice?: string;
+  openPrice?: string;
+  highPrice?: string;
+  lowPrice?: string;
+  priceChange?: string;
+  priceChangePercent?: string;
+  closeTime?: number;
+}
+
+async function requestBinanceTicker(pairSymbol: string): Promise<BinanceTicker> {
+  const url = new URL(BINANCE_TICKER);
+  url.searchParams.set("symbol", pairSymbol);
   const response = await fetch(url, {
     headers: { "User-Agent": "InvestmentLedger/1.0" },
     signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS)
   });
-  if (!response.ok) throw new Error(`CoinGecko 行情返回 ${response.status}`);
-  const payload = (await response.json()) as Record<
-    string,
-    { usd?: number; usd_24h_change?: number }
-  >;
-  const row = payload[id];
-  const price = finiteNumber(row?.usd);
-  if (!row || price <= 0) throw new Error("CoinGecko 未找到该代币行情");
-  const changePercent = finiteNumber(row.usd_24h_change);
+  let payload: BinanceTicker & { code?: number; msg?: string };
+  try {
+    payload = (await response.json()) as BinanceTicker & {
+      code?: number;
+      msg?: string;
+    };
+  } catch {
+    throw new Error(`Binance 行情返回 ${response.status}`);
+  }
+  if (!response.ok || payload.code) {
+    throw new Error(
+      payload.msg === "Invalid symbol."
+        ? "Binance 未找到该交易对"
+        : `Binance 行情返回 ${response.status}`
+    );
+  }
+  return payload;
+}
+
+function isBinanceUnknownSymbol(error: unknown): boolean {
+  return errorMessage(error).includes("未找到该交易对");
+}
+
+function binancePairSymbol(ref: InstrumentRef): string {
+  const raw = ref.symbol.trim().toUpperCase().replace(/[-_/]/g, "");
+  return raw.endsWith("USDT") ? raw : `${raw}USDT`;
+}
+
+async function fetchBinanceQuote(ref: InstrumentRef): Promise<Quote> {
+  const pairSymbol = binancePairSymbol(ref);
+  const row = await requestBinanceTicker(pairSymbol);
+  const price = finiteNumber(row.lastPrice);
+  if (price <= 0) throw new Error("Binance 未找到该代币行情");
   const previousClose =
-    changePercent !== 0 ? price / (1 + changePercent / 100) : price;
+    finiteNumber(row.prevClosePrice) || finiteNumber(row.openPrice) || price;
+  const symbol = pairSymbol.replace(/USDT$/, "");
   const instrument: InstrumentRef = {
     assetType: "crypto",
-    symbol: ref.symbol.toUpperCase(),
-    secid: id
+    symbol,
+    secid: ref.secid || symbol.toLowerCase()
   };
   return {
     ...instrument,
     instrumentId: instrumentIdOf(instrument),
-    name: ref.symbol.toUpperCase(),
-    market: "Crypto",
+    name: symbol,
+    market: "Binance",
     currency: "USD",
     price,
     previousClose,
-    open: previousClose,
-    high: Math.max(price, previousClose),
-    low: Math.min(price, previousClose),
-    change: price - previousClose,
-    changePercent,
-    quoteTime: new Date().toISOString()
+    open: finiteNumber(row.openPrice) || previousClose,
+    high: finiteNumber(row.highPrice),
+    low: finiteNumber(row.lowPrice),
+    change: finiteNumber(row.priceChange) || price - previousClose,
+    changePercent: finiteNumber(row.priceChangePercent),
+    quoteTime: binanceQuoteTime(row.closeTime)
   };
 }
 
@@ -607,12 +1045,26 @@ function isCnListedHit(
   marketName: string
 ): boolean {
   if (CN_MARKET_NAMES.has(marketName)) return true;
-  // 沪深交易所场内 ETF / LOF。场外开放式基金是 MktNum 150，不纳入记账。
+  // 沪深交易所场内 ETF / LOF。
   return (
     marketName === "基金" &&
     (mktNum === "0" || mktNum === "1") &&
     /^\d{6}$/.test(symbol) &&
     /^(0|1)\./.test(secid)
+  );
+}
+
+function isCnOtcFundHit(
+  symbol: string,
+  secid: string,
+  mktNum: string,
+  marketName: string
+): boolean {
+  return (
+    marketName === "基金" &&
+    mktNum === "150" &&
+    /^\d{6}$/.test(symbol) &&
+    secid === `150.${symbol}`
   );
 }
 
@@ -646,6 +1098,48 @@ type EastMoneyField =
 function finiteNumber(value: string | number | null | undefined): number {
   const number = Number(value);
   return Number.isFinite(number) ? number : 0;
+}
+
+function percentNumber(value: string | number | null | undefined): number {
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  const number = Number(String(value ?? "").replace(/%/g, "").trim());
+  return Number.isFinite(number) ? number : 0;
+}
+
+interface JdTradeDateTime {
+  year?: number;
+  monthValue?: number;
+  dayOfMonth?: number;
+  hour?: number;
+  minute?: number;
+  second?: number;
+}
+
+function jdTradeDateTime(value: JdTradeDateTime | null | undefined): string {
+  if (!value?.year || !value.monthValue || !value.dayOfMonth) {
+    return new Date().toISOString();
+  }
+  return new Date(
+    Date.UTC(
+      value.year,
+      value.monthValue - 1,
+      value.dayOfMonth,
+      (value.hour ?? 0) - 8,
+      value.minute ?? 0,
+      value.second ?? 0
+    )
+  ).toISOString();
+}
+
+function jdMillisTime(value: string | number | null | undefined): string {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return new Date().toISOString();
+  return new Date(timestamp > 1e12 ? timestamp : timestamp * 1000).toISOString();
+}
+
+function binanceQuoteTime(value: number | null | undefined): string {
+  if (!Number.isFinite(value) || !value || value <= 0) return new Date().toISOString();
+  return new Date(value).toISOString();
 }
 
 function quoteTime(value: string | number | null | undefined): string {

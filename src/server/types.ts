@@ -1,4 +1,4 @@
-export type AssetType = "cn" | "us" | "crypto";
+export type AssetType = "cn" | "fund" | "us" | "crypto" | "gold";
 export type Currency = "CNY" | "USD";
 
 export interface InstrumentRef {

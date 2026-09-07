@@ -1,5 +1,20 @@
-type AssetType = "cn" | "us" | "crypto";
+type AssetType = "cn" | "fund" | "us" | "crypto" | "gold";
 type Currency = "CNY" | "USD";
+
+interface CategorySummary {
+  label: string;
+  currency: Currency;
+  totalPnl: number;
+  dailyPnl: number;
+  holdingPnl: number;
+  realizedPnl: number;
+  marketValue: number;
+  totalPnlCny: number | null;
+  dailyPnlCny: number | null;
+  holdingPnlCny: number | null;
+  realizedPnlCny: number | null;
+  marketValueCny: number | null;
+}
 
 interface Summary {
   totalPnl: number;
@@ -9,6 +24,7 @@ interface Summary {
   marketValue: number;
   usdCny: number | null;
   fxAvailable: boolean;
+  breakdown: CategorySummary[];
 }
 
 interface Position {
@@ -22,9 +38,12 @@ interface Position {
   avgCost: number;
   currentPrice: number;
   marketValue: number;
+  marketValueCny: number | null;
   holdingPnl: number;
+  holdingPnlCny: number | null;
   holdingPnlPercent: number;
   changePercent: number;
+  dailyMoveLive: boolean;
   quoteTime: string | null;
   quoteAvailable: boolean;
   quoteCached: boolean;
@@ -36,6 +55,15 @@ interface DailyPnl {
   totalPnl: number;
   realizedPnl: number;
   holdingPnl: number;
+  breakdown: Array<{
+    category: string;
+    instrumentId: string;
+    symbol: string;
+    name: string;
+    currency: Currency;
+    dailyPnl: number;
+    dailyPnlCny: number;
+  }>;
 }
 
 interface Dashboard {
@@ -45,7 +73,8 @@ interface Dashboard {
   usedCachedQuotes: boolean;
   hasMissingQuotes: boolean;
   hasCrypto: boolean;
-  market: { cnOpen: boolean; usOpen: boolean };
+  hasGold: boolean;
+  market: { cnOpen: boolean; cnSessionStarted: boolean; usOpen: boolean; goldOpen: boolean };
   updatedAt: string;
 }
 
@@ -85,15 +114,27 @@ const money = new Intl.NumberFormat("zh-CN", {
 });
 
 const PLACEHOLDER: Record<AssetType, string> = {
-  cn: "名称或代码，例如 茅台、159530",
+  cn: "名称或代码，例如 茅台、159530、016665",
+  fund: "场外基金名称或代码，例如 016665",
   us: "名称或代码，例如 苹果、AAPL",
-  crypto: "名称或代码，例如 Bitcoin、BTC"
+  crypto: "名称或代码，例如 Bitcoin、BTC",
+  gold: "银行名称，例如 浙商、民生；留空列出全部"
 };
 
 const HINT: Record<AssetType, string> = {
-  cn: "必须先搜索到股票或 ETF，再按 100 股一手计算买入",
+  cn: "支持 A 股、场内 ETF/LOF 和全部场外基金",
+  fund: "场外基金按最新单位净值和份额记账",
   us: "必须先搜索到美股，金额按美元计算，支持碎股",
-  crypto: "必须先搜索到代币，金额按美元计算"
+  crypto: "必须先搜索到代币，金额按美元计算",
+  gold: "选择银行积存金后按克记账，金额为人民币"
+};
+
+const AMOUNT_PLACEHOLDER: Record<AssetType, string> = {
+  cn: "人民币金额，按整手计算股数",
+  fund: "人民币金额，按净值计算份额",
+  us: "美元金额，支持碎股",
+  crypto: "美元金额，按代币数量计算",
+  gold: "人民币金额，按克计算，最少 0.01 克"
 };
 
 const $ = <T extends HTMLElement>(selector: string): T => {
@@ -126,12 +167,53 @@ function moneyText(value: number, currency: Currency = "CNY"): string {
   return `${currencySymbol(currency)} ${money.format(value)}`;
 }
 
+function priceText(value: number, currency: Currency = "CNY"): string {
+  return `${currencySymbol(currency)} ${formatPrice(value)}`;
+}
+
+function pnlMoney(value: number, currency: Currency = "CNY"): string {
+  return `${currencySymbol(currency)} ${pnl(value)}`;
+}
+
+function withCnyEquiv(
+  native: string,
+  cny: number | null,
+  isPnl: boolean
+): string {
+  if (cny == null) return native;
+  const converted = isPnl ? `¥ ${pnl(cny)}` : `¥ ${money.format(cny)}`;
+  return `${native}<span class="cny-equiv">（${converted}）</span>`;
+}
+
+function holdingPnlText(item: Position): string {
+  return withCnyEquiv(
+    pnlMoney(item.holdingPnl, item.currency),
+    item.holdingPnlCny,
+    true
+  );
+}
+
+function marketValueText(item: Position): string {
+  return withCnyEquiv(
+    moneyText(item.marketValue, item.currency),
+    item.marketValueCny,
+    false
+  );
+}
+
 function formatQty(value: number): string {
   return String(Number(value.toPrecision(12)));
 }
 
 function formatPrice(value: number): string {
-  const digits = value >= 100 ? 2 : value >= 1 ? 4 : 8;
+  const abs = Math.abs(value);
+  let digits = 2;
+  if (abs > 0 && abs < 1) {
+    const leadingZeros = Math.max(0, Math.floor(-Math.log10(abs)));
+    digits = Math.min(12, Math.max(8, leadingZeros + 4));
+  } else if (abs < 100) {
+    digits = 4;
+  }
   return new Intl.NumberFormat("zh-CN", {
     minimumFractionDigits: 2,
     maximumFractionDigits: digits
@@ -139,12 +221,17 @@ function formatPrice(value: number): string {
 }
 
 function quantityUnit(assetType: AssetType): string {
-  return assetType === "crypto" ? "枚" : "股";
+  if (assetType === "fund") return "份";
+  if (assetType === "crypto") return "枚";
+  if (assetType === "gold") return "克";
+  return "股";
 }
 
 function assetLabel(assetType: AssetType, name = ""): string {
+  if (assetType === "fund") return "场外基金";
   if (assetType === "us") return "美股";
   if (assetType === "crypto") return "加密货币";
+  if (assetType === "gold") return "积存金";
   if (/ETF/i.test(name)) return "ETF";
   if (/LOF/i.test(name)) return "LOF";
   return "A股";
@@ -159,6 +246,27 @@ function isCnTradingTime(date = new Date()): boolean {
 
 function isUsTradingTime(date = new Date()): boolean {
   return isSession(date, "America/New_York", [[9.5 * 3600, 16 * 3600]]);
+}
+
+function isGoldTradingTime(date = new Date()): boolean {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).formatToParts(date);
+  const part = (type: string) => parts.find((item) => item.type === type)?.value;
+  const weekday = part("weekday");
+  const seconds =
+    Number(part("hour")) * 3600 +
+    Number(part("minute")) * 60 +
+    Number(part("second"));
+  if (weekday === "Sun") return false;
+  if (weekday === "Sat") return seconds < 4 * 3600;
+  if (weekday === "Mon") return seconds >= 9 * 3600;
+  return true;
 }
 
 function isSession(
@@ -196,19 +304,76 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   return data;
 }
 
+type BreakdownKey = "totalPnl" | "dailyPnl" | "holdingPnl" | "realizedPnl" | "marketValue";
+
+const BREAKDOWN_CNY: Record<BreakdownKey, keyof CategorySummary> = {
+  totalPnl: "totalPnlCny",
+  dailyPnl: "dailyPnlCny",
+  holdingPnl: "holdingPnlCny",
+  realizedPnl: "realizedPnlCny",
+  marketValue: "marketValueCny"
+};
+
+const CN_DAILY_LABELS = new Set(["A股", "ETF", "LOF", "场外基金"]);
+let cnSessionStarted = false;
+
+function isCnDailyPending(item: CategorySummary, key: BreakdownKey): boolean {
+  return (
+    key === "dailyPnl" &&
+    !cnSessionStarted &&
+    CN_DAILY_LABELS.has(item.label) &&
+    item.dailyPnl === 0
+  );
+}
+
+function formatCategoryValue(
+  item: CategorySummary,
+  key: BreakdownKey,
+  isPnl: boolean
+): string {
+  if (isCnDailyPending(item, key)) return "未开盘";
+  const value = item[key];
+  const native = isPnl
+    ? pnlMoney(value, item.currency || "CNY")
+    : moneyText(value, item.currency || "CNY");
+  const cny = item[BREAKDOWN_CNY[key]];
+  return withCnyEquiv(native, typeof cny === "number" ? cny : null, isPnl);
+}
+
+function renderBreakdown(
+  selector: string,
+  breakdown: CategorySummary[],
+  key: BreakdownKey,
+  isPnl: boolean
+): void {
+  const element = $(selector);
+  element.innerHTML = breakdown
+    .map((item) => {
+      const value = item[key];
+      const pending = isCnDailyPending(item, key);
+      return `<div class="breakdown-row">
+        <span>${escapeHtml(item.label)}</span>
+        <strong class="${pending ? "pending" : isPnl ? pnlClass(value) : ""}">${formatCategoryValue(item, key, isPnl)}</strong>
+      </div>`;
+    })
+    .join("");
+}
+
 function setSummary(summary: Summary): void {
-  const values: Array<[string, number]> = [
-    ["#total-pnl", summary.totalPnl],
-    ["#daily-pnl", summary.dailyPnl],
-    ["#holding-pnl", summary.holdingPnl],
-    ["#realized-pnl", summary.realizedPnl]
+  const cards: Array<[string, number, BreakdownKey, boolean]> = [
+    ["total-pnl", summary.totalPnl, "totalPnl", true],
+    ["daily-pnl", summary.dailyPnl, "dailyPnl", true],
+    ["holding-pnl", summary.holdingPnl, "holdingPnl", true],
+    ["realized-pnl", summary.realizedPnl, "realizedPnl", true],
+    ["market-value", summary.marketValue, "marketValue", false]
   ];
-  for (const [selector, value] of values) {
-    const element = $(selector);
-    element.textContent = `¥ ${pnl(value)}`;
-    element.className = `metric-value ${pnlClass(value)}`;
+  const breakdown = summary.breakdown ?? [];
+  for (const [id, value, key, isPnl] of cards) {
+    const element = $(`#${id}`);
+    element.textContent = isPnl ? `¥ ${pnl(value)}` : `¥ ${money.format(value)}`;
+    element.className = `metric-value ${isPnl ? pnlClass(value) : ""}`;
+    renderBreakdown(`#${id}-breakdown`, breakdown, key, isPnl);
   }
-  $("#market-value").textContent = `¥ ${money.format(summary.marketValue)}`;
 }
 
 function renderPositions(positions: Position[]): void {
@@ -241,11 +406,13 @@ function renderPositions(positions: Position[]): void {
           <small>${escapeHtml(item.symbol)}</small>
         </td>
         <td>${formatQty(item.shares)}</td>
-        <td>${moneyText(item.avgCost, item.currency)}</td>
-        <td>${moneyText(item.currentPrice, item.currency)}${item.quoteCached ? '<small class="warning">沿用上次行情</small>' : item.quoteAvailable ? "" : '<small class="warning">暂无可用行情</small>'}</td>
-        <td class="${pnlClass(item.changePercent)}">${pnl(item.changePercent)}%</td>
-        <td>${moneyText(item.marketValue, item.currency)}</td>
-        <td class="${pnlClass(item.holdingPnl)}">${pnl(item.holdingPnl)}</td>
+        <td>${priceText(item.avgCost, item.currency)}</td>
+        <td>${priceText(item.currentPrice, item.currency)}${item.quoteCached ? '<small class="warning">沿用上次行情</small>' : item.quoteAvailable ? "" : '<small class="warning">暂无可用行情</small>'}</td>
+        <td class="${item.dailyMoveLive ? pnlClass(item.changePercent) : "pending"}">${
+          item.dailyMoveLive ? `${pnl(item.changePercent)}%` : "—"
+        }</td>
+        <td>${marketValueText(item)}</td>
+        <td class="${pnlClass(item.holdingPnl)}">${holdingPnlText(item)}</td>
         <td class="${pnlClass(item.holdingPnlPercent)}">${pnl(item.holdingPnlPercent)}%</td>
         <td><button class="link-button sell-all" data-id="${escapeHtml(item.instrumentId)}">清仓</button></td>
       </tr>`
@@ -261,25 +428,144 @@ function renderPositions(positions: Position[]): void {
   });
 }
 
+let openDailyPnlCell: HTMLElement | null = null;
+let openDailyTooltipDay: string | null = null;
+
+function closeDailyTooltip(): void {
+  openDailyPnlCell
+    ?.querySelector<HTMLElement>(".daily-tooltip")
+    ?.classList.remove("visible");
+  openDailyPnlCell
+    ?.querySelector<HTMLElement>(".daily-pnl-trigger")
+    ?.setAttribute("aria-expanded", "false");
+  openDailyPnlCell = null;
+  openDailyTooltipDay = null;
+}
+
+function openDailyTooltip(cell: HTMLElement): void {
+  const tooltip = cell.querySelector<HTMLElement>(".daily-tooltip");
+  if (!tooltip) return;
+  if (openDailyPnlCell === cell) return;
+  closeDailyTooltip();
+
+  openDailyPnlCell = cell;
+  openDailyTooltipDay = cell.dataset.day ?? null;
+  tooltip.classList.add("visible");
+  cell
+    .querySelector<HTMLElement>(".daily-pnl-trigger")
+    ?.setAttribute("aria-expanded", "true");
+  const anchor = cell.getBoundingClientRect();
+  const box = tooltip.getBoundingClientRect();
+  const margin = 12;
+  const gap = 7;
+  const left = Math.max(
+    margin,
+    Math.min(anchor.right - box.width, window.innerWidth - box.width - margin)
+  );
+  const below = anchor.bottom + gap;
+  const top =
+    below + box.height <= window.innerHeight - margin
+      ? below
+      : Math.max(margin, anchor.top - box.height - gap);
+  tooltip.style.left = `${left}px`;
+  tooltip.style.top = `${top}px`;
+}
+
+document.addEventListener("click", closeDailyTooltip);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeDailyTooltip();
+});
+
 function renderDaily(items: DailyPnl[]): void {
   const body = $("#daily-body");
+  const preservedOpenDay = openDailyTooltipDay;
+  openDailyPnlCell = null;
   if (!items.length) {
+    openDailyTooltipDay = null;
     body.innerHTML = '<tr><td colspan="5" class="empty">暂无每日收益记录</td></tr>';
     return;
   }
   body.innerHTML = items
     .slice(0, 30)
-    .map(
-      (item) => `
+    .map((item) => {
+      const categories = new Map<string, DailyPnl["breakdown"]>();
+      for (const detail of item.breakdown ?? []) {
+        const category = categories.get(detail.category) ?? [];
+        category.push(detail);
+        categories.set(detail.category, category);
+      }
+      const sortedCategories = [...categories.entries()].sort(
+        ([, left], [, right]) =>
+          right.reduce((sum, detail) => sum + detail.dailyPnlCny, 0) -
+          left.reduce((sum, detail) => sum + detail.dailyPnlCny, 0)
+      );
+      const detailHtml = sortedCategories.length
+        ? `<div class="daily-tooltip" role="tooltip">
+            <div class="daily-tooltip-title">${item.day} 收益明细</div>
+            ${sortedCategories
+              .map(([category, details]) => {
+                const sorted = [...details].sort(
+                  (a, b) => b.dailyPnlCny - a.dailyPnlCny
+                );
+                const categoryPnl = sorted.reduce(
+                  (sum, detail) => sum + detail.dailyPnlCny,
+                  0
+                );
+                return `<div class="daily-category">
+                  <div class="daily-category-row">
+                    <strong>${escapeHtml(category)}</strong>
+                    <strong class="${pnlClass(categoryPnl)}">¥ ${pnl(categoryPnl)}</strong>
+                  </div>
+                  ${sorted
+                    .map(
+                      (detail) => `<div class="daily-detail-row">
+                        <span>${escapeHtml(detail.name)} <small>${escapeHtml(detail.symbol)}</small></span>
+                        <strong class="${pnlClass(detail.dailyPnlCny)}">¥ ${pnl(detail.dailyPnlCny)}</strong>
+                      </div>`
+                    )
+                    .join("")}
+                </div>`;
+              })
+              .join("")}
+          </div>`
+        : `<div class="daily-tooltip daily-tooltip-empty" role="tooltip">该日期暂无分类明细（升级前记录）</div>`;
+      return `
       <tr>
         <td>${item.day}</td>
-        <td class="${pnlClass(item.dailyPnl)}">${pnl(item.dailyPnl)}</td>
+        <td class="daily-pnl-cell ${pnlClass(item.dailyPnl)}" data-day="${item.day}">
+          <span class="daily-pnl-trigger" role="button" tabindex="0" aria-expanded="false" aria-label="${item.day} 当日收益 ${pnl(item.dailyPnl)}，查看收益明细">${pnl(item.dailyPnl)}</span>
+          ${detailHtml}
+        </td>
         <td class="${pnlClass(item.totalPnl)}">${pnl(item.totalPnl)}</td>
         <td class="${pnlClass(item.realizedPnl)}">${pnl(item.realizedPnl)}</td>
         <td class="${pnlClass(item.holdingPnl)}">${pnl(item.holdingPnl)}</td>
-      </tr>`
-    )
+      </tr>`;
+    })
     .join("");
+
+  body.querySelectorAll<HTMLElement>(".daily-pnl-cell").forEach((cell) => {
+    cell.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if ((event.target as HTMLElement).closest(".daily-tooltip")) return;
+      openDailyTooltip(cell);
+    });
+    cell.querySelector<HTMLElement>(".daily-pnl-trigger")?.addEventListener(
+      "keydown",
+      (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        event.stopPropagation();
+        openDailyTooltip(cell);
+      }
+    );
+  });
+  if (preservedOpenDay) {
+    const preservedCell = body.querySelector<HTMLElement>(
+      `.daily-pnl-cell[data-day="${CSS.escape(preservedOpenDay)}"]`
+    );
+    if (preservedCell) openDailyTooltip(preservedCell);
+    else openDailyTooltipDay = null;
+  }
 }
 
 function renderTrades(items: Trade[]): void {
@@ -300,7 +586,7 @@ function renderTrades(items: Trade[]): void {
         </td>
         <td><span class="tag ${item.side === "BUY" ? "buy" : "sell"}">${item.side === "BUY" ? "买入" : "卖出"}</span></td>
         <td>${formatQty(item.shares)}</td>
-        <td>${moneyText(item.price, item.currency)}</td>
+        <td>${priceText(item.price, item.currency)}</td>
         <td>${moneyText(item.amount, item.currency)}</td>
         <td class="${pnlClass(item.realized_pnl)}">${item.side === "SELL" ? pnl(item.realized_pnl) : "—"}</td>
       </tr>`
@@ -311,6 +597,7 @@ function renderTrades(items: Trade[]): void {
 let loading = false;
 let usingCachedQuotes = false;
 let hasCryptoPositions = false;
+let hasGoldPositions = false;
 let fxWarning = false;
 
 async function refresh(): Promise<void> {
@@ -322,14 +609,16 @@ async function refresh(): Promise<void> {
       request<Dashboard>("/api/dashboard"),
       request<Trade[]>("/api/trades")
     ]);
+    usingCachedQuotes = dashboard.usedCachedQuotes;
+    hasCryptoPositions = dashboard.hasCrypto;
+    hasGoldPositions = dashboard.hasGold;
+    cnSessionStarted = dashboard.market.cnSessionStarted;
+    fxWarning = dashboard.positions.some((item) => item.currency === "USD") &&
+      !dashboard.summary.fxAvailable;
     setSummary(dashboard.summary);
     renderPositions(dashboard.positions);
     renderDaily(dashboard.daily);
     renderTrades(trades);
-    usingCachedQuotes = dashboard.usedCachedQuotes;
-    hasCryptoPositions = dashboard.hasCrypto;
-    fxWarning = dashboard.positions.some((item) => item.currency === "USD") &&
-      !dashboard.summary.fxAvailable;
     $("#updated-at").textContent = `最后更新 ${new Date(
       dashboard.updatedAt
     ).toLocaleTimeString("zh-CN")}${dashboard.usedCachedQuotes ? "（收益未重新计算）" : ""}${
@@ -354,7 +643,12 @@ function showMessage(message: string, isError = false): void {
 }
 
 function shouldAutoRefresh(): boolean {
-  return hasCryptoPositions || isCnTradingTime() || isUsTradingTime();
+  return (
+    hasCryptoPositions ||
+    isCnTradingTime() ||
+    isUsTradingTime() ||
+    (hasGoldPositions && isGoldTradingTime())
+  );
 }
 
 function updateMarketStatus(): void {
@@ -372,6 +666,7 @@ function updateMarketStatus(): void {
   const parts: string[] = [];
   if (isCnTradingTime()) parts.push("A股交易中");
   if (isUsTradingTime()) parts.push("美股交易中");
+  if (hasGoldPositions && isGoldTradingTime()) parts.push("积存金交易中");
   if (hasCryptoPositions) parts.push("加密货币 24h");
   if (parts.length) {
     element.textContent = `${parts.join(" · ")} · 每 5 秒刷新`;
@@ -391,11 +686,17 @@ function formData(form: HTMLFormElement): Record<string, string> {
   );
 }
 
+let activeSearchAssetType: AssetType = "cn";
+
 function currentAssetType(): AssetType {
-  return ($("#buy-asset-type") as HTMLInputElement).value as AssetType;
+  return activeSearchAssetType;
 }
 
 function clearSelectedInstrument(): void {
+  ($("#buy-asset-type") as HTMLInputElement).value = activeSearchAssetType;
+  ($("#buy-amount") as HTMLInputElement).placeholder =
+    AMOUNT_PLACEHOLDER[activeSearchAssetType];
+  $("#buy-hint").textContent = HINT[activeSearchAssetType];
   ($("#buy-instrument-id") as HTMLInputElement).value = "";
   ($("#buy-symbol") as HTMLInputElement).value = "";
   ($("#buy-secid") as HTMLInputElement).value = "";
@@ -407,8 +708,10 @@ function clearSelectedInstrument(): void {
 }
 
 function setAssetType(assetType: AssetType): void {
+  activeSearchAssetType = assetType;
   ($("#buy-asset-type") as HTMLInputElement).value = assetType;
   ($("#buy-query") as HTMLInputElement).placeholder = PLACEHOLDER[assetType];
+  ($("#buy-amount") as HTMLInputElement).placeholder = AMOUNT_PLACEHOLDER[assetType];
   $("#buy-hint").textContent = HINT[assetType];
   document.querySelectorAll<HTMLButtonElement>("#buy-asset-tabs .tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.type === assetType);
@@ -417,12 +720,14 @@ function setAssetType(assetType: AssetType): void {
   $("#buy-search-results").innerHTML = "";
   ($("#buy-query") as HTMLInputElement).value = "";
   clearSelectedInstrument();
+  if (assetType === "gold") void runSearch(true);
 }
 
-async function runSearch(): Promise<void> {
+async function runSearch(allowEmpty = false): Promise<void> {
   const query = ($("#buy-query") as HTMLInputElement).value.trim();
+  const match = ($("#buy-search-mode") as HTMLSelectElement).value;
   const results = $("#buy-search-results");
-  if (!query) {
+  if (!query && !allowEmpty && currentAssetType() !== "gold") {
     showMessage("请输入要搜索的名称或代码", true);
     return;
   }
@@ -431,7 +736,7 @@ async function runSearch(): Promise<void> {
   clearSelectedInstrument();
   try {
     const hits = await request<SearchHit[]>(
-      `/api/search?type=${currentAssetType()}&q=${encodeURIComponent(query)}`
+      `/api/search?type=${currentAssetType()}&match=${encodeURIComponent(match)}&q=${encodeURIComponent(query)}`
     );
     if (!hits.length) {
       results.innerHTML =
@@ -443,6 +748,7 @@ async function runSearch(): Promise<void> {
         (hit) => `
         <button type="button" class="search-hit"
           data-id="${escapeHtml(hit.instrumentId)}"
+          data-asset-type="${hit.assetType}"
           data-symbol="${escapeHtml(hit.symbol)}"
           data-secid="${escapeHtml(hit.secid)}"
           data-name="${escapeHtml(hit.name)}"
@@ -469,13 +775,17 @@ async function runSearch(): Promise<void> {
 async function selectHit(button: HTMLButtonElement): Promise<void> {
   const hit: SearchHit = {
     instrumentId: button.dataset.id || "",
-    assetType: currentAssetType(),
+    assetType: (button.dataset.assetType || currentAssetType()) as AssetType,
     symbol: button.dataset.symbol || "",
     secid: button.dataset.secid || "",
     name: button.dataset.name || "",
     market: button.dataset.market || "",
     currency: (button.dataset.currency || "CNY") as Currency
   };
+  ($("#buy-asset-type") as HTMLInputElement).value = hit.assetType;
+  ($("#buy-amount") as HTMLInputElement).placeholder =
+    AMOUNT_PLACEHOLDER[hit.assetType];
+  $("#buy-hint").textContent = HINT[hit.assetType];
   ($("#buy-instrument-id") as HTMLInputElement).value = hit.instrumentId;
   ($("#buy-symbol") as HTMLInputElement).value = hit.symbol;
   ($("#buy-secid") as HTMLInputElement).value = hit.secid;
@@ -503,7 +813,7 @@ async function selectHit(button: HTMLButtonElement): Promise<void> {
     selected.innerHTML = `
       <div>
         <strong>已选择 ${escapeHtml(hit.name)}</strong>
-        <small>${escapeHtml(hit.symbol)} · ${escapeHtml(hit.market)} · 现价 ${moneyText(quote.price, quote.currency)}</small>
+        <small>${escapeHtml(hit.symbol)} · ${escapeHtml(hit.market)} · 现价 ${priceText(quote.price, quote.currency)}</small>
       </div>
       <button type="button" class="clear-pick" id="clear-pick">重选</button>
     `;
@@ -560,7 +870,7 @@ $("#buy-form").addEventListener("submit", async (event) => {
     showMessage(
       `${result.message}，使用 ${moneyText(result.usedAmount, result.currency)}，剩余 ${moneyText(result.remainingAmount, result.currency)}`
     );
-    const keptType = (data.assetType as AssetType) || "cn";
+    const keptType = activeSearchAssetType;
     form.reset();
     setAssetType(keptType);
     await refresh();

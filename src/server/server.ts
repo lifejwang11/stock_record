@@ -6,6 +6,7 @@ import {
   addSell,
   getPosition,
   getQuoteCache,
+  listDailySnapshotBreakdowns,
   listDailySnapshots,
   listPositions,
   listTrades,
@@ -24,7 +25,7 @@ import type { AssetType, Currency, InstrumentRef, Quote } from "./types.js";
 
 const PORT = Number(process.env.PORT || 3000);
 const publicDir = resolve(process.cwd(), "public");
-const ASSET_TYPES = new Set<AssetType>(["cn", "us", "crypto"]);
+const ASSET_TYPES = new Set<AssetType>(["cn", "fund", "us", "crypto", "gold"]);
 
 function json(response: ServerResponse, status: number, data: unknown): void {
   response.writeHead(status, {
@@ -75,21 +76,43 @@ function tradeTime(value: unknown): string {
 function parseAssetType(value: unknown): AssetType {
   const assetType = String(value || "");
   if (!ASSET_TYPES.has(assetType as AssetType)) {
-    throw new Error("请选择 A 股、美股或加密货币");
+    throw new Error("请选择 A 股、场外基金、美股、加密货币或积存金");
   }
   return assetType as AssetType;
+}
+
+function parseSearchMatch(value: string | null): "fuzzy" | "exact" {
+  if (!value || value === "fuzzy") return "fuzzy";
+  if (value === "exact") return "exact";
+  throw new Error("搜索匹配方式无效");
+}
+
+function exactSearchHits<T extends { symbol: string; name: string }>(
+  hits: T[],
+  query: string
+): T[] {
+  const needle = query.trim().toLocaleLowerCase("zh-CN");
+  return hits.filter(
+    (hit) =>
+      hit.symbol.trim().toLocaleLowerCase("zh-CN") === needle ||
+      hit.name.trim().toLocaleLowerCase("zh-CN") === needle
+  );
 }
 
 function parseInstrument(body: Record<string, unknown>): InstrumentRef & {
   instrumentId: string;
 } {
-  const assetType = parseAssetType(body.assetType);
+  const requestedAssetType = parseAssetType(body.assetType);
   const symbol = String(body.symbol || "").trim();
   const secid = String(body.secid || "").trim();
   const instrumentId = String(body.instrumentId || "").trim();
   if (!symbol || !instrumentId) {
     throw new Error("请先搜索并选择标的，确认后再记录");
   }
+  const assetType =
+    requestedAssetType === "cn" && secid.startsWith("150.")
+      ? ("fund" as const)
+      : requestedAssetType;
   const ref: InstrumentRef = { assetType, symbol, secid };
   const expected = instrumentIdOf(ref);
   if (instrumentId !== expected) {
@@ -109,10 +132,18 @@ function buyQuantity(assetType: AssetType, amount: number, price: number): numbe
     }
     return shares;
   }
-  const scale = assetType === "us" ? 10000 : 100_000_000;
+  if (assetType === "fund") {
+    const shares = Math.floor((amount / price) * 100) / 100;
+    if (shares <= 0) throw new Error("金额不足，无法按当前净值买入至少 0.01 份");
+    return shares;
+  }
+  const scale =
+    assetType === "us" ? 10000 : assetType === "gold" ? 100 : 100_000_000;
   const quantity = Math.floor((amount / price) * scale) / scale;
   if (quantity <= 0) {
-    throw new Error(`金额不足，无法按当前价格买入至少 1 ${unit === "枚" ? "枚代币" : "股"}`);
+    const minLabel =
+      assetType === "gold" ? "0.01 克" : unit === "枚" ? "1 枚代币" : "1 股";
+    throw new Error(`金额不足，无法按当前价格买入至少 ${minLabel}`);
   }
   return quantity;
 }
@@ -158,15 +189,91 @@ function isCnTradingTime(date = new Date()): boolean {
   return morning || afternoon;
 }
 
+function hasCnSessionStarted(date = new Date()): boolean {
+  if (!isWeekday("Asia/Shanghai", date)) return false;
+  return secondsOfDay("Asia/Shanghai", date) >= 9.5 * 3600;
+}
+
+function isQuoteOnShanghaiDay(quoteTime: string | null, date = new Date()): boolean {
+  if (!quoteTime) return false;
+  const quoted = new Date(quoteTime);
+  if (Number.isNaN(quoted.getTime())) return false;
+  return shanghaiDay(quoted) === shanghaiDay(date);
+}
+
+function cnDailyMoveLive(quoteTime: string | null, date = new Date()): boolean {
+  return hasCnSessionStarted(date) && isQuoteOnShanghaiDay(quoteTime, date);
+}
+
 function isUsTradingTime(date = new Date()): boolean {
   if (!isWeekday("America/New_York", date)) return false;
   const seconds = secondsOfDay("America/New_York", date);
   return seconds >= 9.5 * 3600 && seconds <= 16 * 3600;
 }
 
+function isGoldTradingTime(date = new Date()): boolean {
+  const weekday = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    weekday: "short"
+  }).format(date);
+  const seconds = secondsOfDay("Asia/Shanghai", date);
+  if (weekday === "Sun") return false;
+  if (weekday === "Sat") return seconds < 4 * 3600;
+  if (weekday === "Mon") return seconds >= 9 * 3600;
+  return true;
+}
+
 function toCny(amount: number, currency: Currency, usdCny: number | null): number {
   if (currency === "CNY") return amount;
   return usdCny ? amount * usdCny : amount;
+}
+
+const CATEGORY_ORDER = ["美股", "加密货币", "A股", "ETF", "LOF", "场外基金", "积存金"];
+const POSITION_ASSET_ORDER: AssetType[] = ["us", "crypto", "cn", "fund", "gold"];
+
+interface CategoryBreakdown {
+  label: string;
+  currency: Currency;
+  totalPnl: number;
+  dailyPnl: number;
+  holdingPnl: number;
+  realizedPnl: number;
+  marketValue: number;
+  totalPnlCny: number | null;
+  dailyPnlCny: number | null;
+  holdingPnlCny: number | null;
+  realizedPnlCny: number | null;
+  marketValueCny: number | null;
+}
+
+function categoryCurrency(label: string): Currency {
+  return label === "美股" || label === "加密货币" ? "USD" : "CNY";
+}
+
+function emptyBreakdown(label: string): CategoryBreakdown {
+  return {
+    label,
+    currency: categoryCurrency(label),
+    totalPnl: 0,
+    dailyPnl: 0,
+    holdingPnl: 0,
+    realizedPnl: 0,
+    marketValue: 0,
+    totalPnlCny: null,
+    dailyPnlCny: null,
+    holdingPnlCny: null,
+    realizedPnlCny: null,
+    marketValueCny: null
+  };
+}
+
+function convertIfForeign(
+  amount: number,
+  currency: Currency,
+  usdCny: number | null
+): number | null {
+  if (currency === "CNY" || !usdCny) return null;
+  return toCny(amount, currency, usdCny);
 }
 
 async function liveQuote(ref: InstrumentRef): Promise<Quote> {
@@ -220,6 +327,9 @@ async function dashboard() {
       const quote = quoteResult?.quote;
       const currentPrice = quote?.price ?? position.avg_cost;
       const holdingPnl = (currentPrice - position.avg_cost) * position.shares;
+      const dailyMoveLive =
+        !["cn", "fund"].includes(position.asset_type) ||
+        cnDailyMoveLive(quote?.quoteTime ?? null);
       return {
         instrumentId: position.instrument_id,
         assetType: position.asset_type,
@@ -231,16 +341,33 @@ async function dashboard() {
         avgCost: position.avg_cost,
         currentPrice,
         marketValue: currentPrice * position.shares,
+        marketValueCny: convertIfForeign(
+          currentPrice * position.shares,
+          position.currency,
+          usdCny
+        ),
         holdingPnl,
+        holdingPnlCny: convertIfForeign(holdingPnl, position.currency, usdCny),
         holdingPnlPercent: position.avg_cost
           ? ((currentPrice - position.avg_cost) / position.avg_cost) * 100
           : 0,
-        change: quote?.change ?? 0,
-        changePercent: quote?.changePercent ?? 0,
+        change: dailyMoveLive ? (quote?.change ?? 0) : 0,
+        changePercent: dailyMoveLive ? (quote?.changePercent ?? 0) : 0,
+        dailyMoveLive,
         quoteTime: quote?.quoteTime ?? null,
         quoteAvailable: Boolean(quoteResult?.isLive),
         quoteCached: Boolean(quote && !quoteResult?.isLive)
       };
+    })
+    .sort((a, b) => {
+      const left = POSITION_ASSET_ORDER.indexOf(a.assetType);
+      const right = POSITION_ASSET_ORDER.indexOf(b.assetType);
+      const typeDiff = (left < 0 ? 99 : left) - (right < 0 ? 99 : right);
+      if (typeDiff !== 0) return typeDiff;
+      return (
+        a.name.localeCompare(b.name, "zh-CN") ||
+        a.symbol.localeCompare(b.symbol, "zh-CN")
+      );
     });
 
   const realizedPnl = allPositions.reduce(
@@ -254,28 +381,143 @@ async function dashboard() {
   );
   const totalPnl = realizedPnl + holdingPnl;
   const day = shanghaiDay();
+  const groups = new Map<string, CategoryBreakdown>();
+  const dailyInstrumentPnl = new Map<
+    string,
+    {
+      category: string;
+      instrumentId: string;
+      symbol: string;
+      name: string;
+      currency: Currency;
+      dailyPnl: number;
+    }
+  >();
+  const dailyInstrument = (input: {
+    category: string;
+    instrumentId: string;
+    symbol: string;
+    name: string;
+    currency: Currency;
+  }) => {
+    const current = dailyInstrumentPnl.get(input.instrumentId);
+    if (current) return current;
+    const created = { ...input, dailyPnl: 0 };
+    dailyInstrumentPnl.set(input.instrumentId, created);
+    return created;
+  };
+  const bucket = (label: string) => {
+    const current = groups.get(label);
+    if (current) return current;
+    const created = emptyBreakdown(label);
+    groups.set(label, created);
+    return created;
+  };
+  for (const position of allPositions) {
+    bucket(assetLabel(position.asset_type, position.name)).realizedPnl +=
+      position.realized_pnl;
+  }
+  for (const position of positions) {
+    const item = bucket(position.assetLabel);
+    item.holdingPnl += position.holdingPnl;
+    item.marketValue += position.marketValue;
+    item.dailyPnl += position.change * position.shares;
+    dailyInstrument({
+      category: position.assetLabel,
+      instrumentId: position.instrumentId,
+      symbol: position.symbol,
+      name: position.name,
+      currency: position.currency
+    }).dailyPnl += position.change * position.shares;
+  }
+  for (const trade of listTrades(500)) {
+    if (trade.side !== "SELL") continue;
+    if (shanghaiDay(new Date(trade.traded_at)) !== day) continue;
+    const category = assetLabel(trade.asset_type, trade.name);
+    bucket(category).dailyPnl += trade.realized_pnl;
+    dailyInstrument({
+      category,
+      instrumentId: trade.instrument_id,
+      symbol: trade.symbol,
+      name: trade.name,
+      currency: trade.currency
+    }).dailyPnl += trade.realized_pnl;
+  }
+  for (const item of groups.values()) {
+    item.totalPnl = item.holdingPnl + item.realizedPnl;
+    item.totalPnlCny = convertIfForeign(item.totalPnl, item.currency, usdCny);
+    item.dailyPnlCny = convertIfForeign(item.dailyPnl, item.currency, usdCny);
+    item.holdingPnlCny = convertIfForeign(item.holdingPnl, item.currency, usdCny);
+    item.realizedPnlCny = convertIfForeign(item.realizedPnl, item.currency, usdCny);
+    item.marketValueCny = convertIfForeign(item.marketValue, item.currency, usdCny);
+  }
+  const breakdown = [...groups.values()]
+    .filter(
+      (item) =>
+        item.marketValue !== 0 ||
+        item.holdingPnl !== 0 ||
+        item.realizedPnl !== 0 ||
+        item.dailyPnl !== 0 ||
+        item.totalPnl !== 0
+    )
+    .sort((a, b) => {
+      const left = CATEGORY_ORDER.indexOf(a.label);
+      const right = CATEGORY_ORDER.indexOf(b.label);
+      return (left === -1 ? 99 : left) - (right === -1 ? 99 : right);
+    });
   const usedCachedQuotes = [...quotes.values()].some((result) => !result.isLive);
   const hasMissingQuotes = [...quotes.values()].some((result) => !result.quote);
+  const dailyPnl = breakdown.reduce(
+    (sum, item) => sum + toCny(item.dailyPnl, item.currency, usdCny),
+    0
+  );
   if (!usedCachedQuotes && fxAvailable) {
-    saveDailySnapshot({ day, totalPnl, realizedPnl, holdingPnl });
+    saveDailySnapshot({
+      day,
+      dailyPnl,
+      totalPnl,
+      realizedPnl,
+      holdingPnl,
+      breakdowns: [...dailyInstrumentPnl.values()].map((item) => ({
+        ...item,
+        dailyPnlCny: toCny(item.dailyPnl, item.currency, usdCny)
+      }))
+    });
   }
 
   const snapshots = listDailySnapshots();
+  const storedBreakdowns = listDailySnapshotBreakdowns();
+  const breakdownsByDay = new Map<string, typeof storedBreakdowns>();
+  for (const item of storedBreakdowns) {
+    const items = breakdownsByDay.get(item.day) ?? [];
+    items.push(item);
+    breakdownsByDay.set(item.day, items);
+  }
   const daily = snapshots
     .map((snapshot, index) => ({
       day: snapshot.day,
       dailyPnl:
+        snapshot.daily_pnl ??
         snapshot.total_pnl - (index > 0 ? snapshots[index - 1]!.total_pnl : 0),
       totalPnl: snapshot.total_pnl,
       realizedPnl: snapshot.realized_pnl,
-      holdingPnl: snapshot.holding_pnl
+      holdingPnl: snapshot.holding_pnl,
+      breakdown: (breakdownsByDay.get(snapshot.day) ?? []).map((item) => ({
+        category: item.category,
+        instrumentId: item.instrument_id,
+        symbol: item.symbol,
+        name: item.name,
+        currency: item.currency,
+        dailyPnl: item.daily_pnl,
+        dailyPnlCny: item.daily_pnl_cny
+      }))
     }))
     .reverse();
 
   return {
     summary: {
       totalPnl,
-      dailyPnl: daily[0]?.dailyPnl ?? 0,
+      dailyPnl,
       realizedPnl,
       holdingPnl,
       marketValue: positions.reduce(
@@ -284,16 +526,20 @@ async function dashboard() {
         0
       ),
       usdCny,
-      fxAvailable
+      fxAvailable,
+      breakdown
     },
     positions,
     daily,
     usedCachedQuotes,
     hasMissingQuotes,
     hasCrypto: positions.some((position) => position.assetType === "crypto"),
+    hasGold: positions.some((position) => position.assetType === "gold"),
     market: {
       cnOpen: isCnTradingTime(),
-      usOpen: isUsTradingTime()
+      cnSessionStarted: hasCnSessionStarted(),
+      usOpen: isUsTradingTime(),
+      goldOpen: isGoldTradingTime()
     },
     updatedAt: new Date().toISOString()
   };
@@ -310,7 +556,9 @@ async function api(
     if (request.method === "GET" && url.pathname === "/api/search") {
       const query = url.searchParams.get("q") || "";
       const assetType = parseAssetType(url.searchParams.get("type"));
-      json(response, 200, await searchInstruments(query, assetType));
+      const match = parseSearchMatch(url.searchParams.get("match"));
+      const hits = await searchInstruments(query, assetType);
+      json(response, 200, match === "exact" ? exactSearchHits(hits, query) : hits);
       return true;
     }
 
@@ -351,7 +599,9 @@ async function api(
           : positiveNumber(body.price, "买入价格");
       const shares = buyQuantity(instrument.assetType, amount, price);
       const name =
-        instrument.assetType === "crypto"
+        instrument.assetType === "crypto" ||
+        instrument.assetType === "gold" ||
+        instrument.assetType === "fund"
           ? String(body.name || quote.name)
           : quote.name;
       addBuy({
@@ -454,7 +704,8 @@ async function staticFile(
     };
     response.writeHead(200, {
       "Content-Type":
-        contentTypes[extname(filePath)] || "application/octet-stream"
+        contentTypes[extname(filePath)] || "application/octet-stream",
+      "Cache-Control": "no-store"
     });
     response.end(content);
   } catch {
